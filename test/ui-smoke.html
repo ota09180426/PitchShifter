@@ -71,6 +71,12 @@
   }
   log.push('silent warn='+ api.engine.silent + ', msg=' + JSON.stringify(q('.msg').textContent));
   log.push('status=' + q('.status').textContent + ', fallbackReason=' + api.engine.fallbackReason);
+  log.push('diag=' + q('.diag-text').textContent);
+  q('.mute').click();
+  log.push('mute on: outputMuted=' + api.engine.outputMuted + ', btn=' + q('.mute').textContent);
+  q('.mute').click();
+  log.push('mute off: outputMuted=' + api.engine.outputMuted + ', btn=' + q('.mute').textContent);
+  q('.tone').click();
 
   for (let i = 0; i < 30; i++) q('.plus').click();
   log.push('clamp max: value=' + api.ui.value + ', plus disabled=' + q('.plus').disabled);

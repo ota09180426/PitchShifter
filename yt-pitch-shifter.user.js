@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Pitch Shifter
 // @namespace    https://pitchshifter.local/
-// @version      0.1.0
+// @version      0.1.1
 // @description  YouTube の再生中に、テンポを保ったままキーを ±6 半音（0.5 半音刻み）で変更します
 // @match        https://m.youtube.com/*
 // @match        https://www.youtube.com/*
@@ -381,6 +381,7 @@
   window.__ytPitchShifterLoaded = true;
 
   const LOG = '[YT Pitch Shifter]';
+  const VERSION = '0.1.1';
   const WORKLET_NAME = 'yt-pitch-shifter-v1';
 
   function buildWorkletSource() {
@@ -420,7 +421,7 @@ class YTPitchShifterProcessor extends AudioWorkletProcessor {
     this.peak = pk;
     this.count += n;
     if (this.count >= sampleRate / 2) {
-      this.port.postMessage({ type: 'level', peak: this.peak });
+      this.port.postMessage({ type: 'level', peak: this.peak, st: this.dsp.semitones });
       this.peak = 0;
       this.count = 0;
     }
@@ -459,6 +460,9 @@ registerProcessor('${WORKLET_NAME}', YTPitchShifterProcessor);
       this.error = '';
       this.silent = false;
       this.silentCount = 0;
+      this.lastPeak = null;
+      this.procSemitones = null;
+      this.outputMuted = false;
       this.listeners = new Set();
     }
 
@@ -545,7 +549,7 @@ registerProcessor('${WORKLET_NAME}', YTPitchShifterProcessor);
         });
         node.port.onmessage = (e) => {
           const d = e.data;
-          if (d && d.type === 'level') this._onLevel(d.peak);
+          if (d && d.type === 'level') this._onLevel(d.peak, d.st);
         };
         node.onprocessorerror = () => {
           this.error = '音声処理でエラーが発生しました。ページを再読み込みしてください。';
@@ -573,7 +577,7 @@ registerProcessor('${WORKLET_NAME}', YTPitchShifterProcessor);
           }
           count += n;
           if (count >= ctx.sampleRate / 2) {
-            this._onLevel(peak);
+            this._onLevel(peak, dsp.semitones);
             peak = 0;
             count = 0;
           }
@@ -632,7 +636,41 @@ registerProcessor('${WORKLET_NAME}', YTPitchShifterProcessor);
       }
     }
 
-    _onLevel(peak) {
+    /** 診断用: 処理後の音を出力から切り離す／戻す */
+    setOutputMuted(muted) {
+      if (!this.node || !this.ctx || muted === this.outputMuted) return;
+      try {
+        if (muted) this.node.disconnect(this.ctx.destination);
+        else this.node.connect(this.ctx.destination);
+        this.outputMuted = muted;
+      } catch (e) {
+        console.error(LOG, e);
+      }
+      this.emit();
+    }
+
+    /** 診断用: Web Audio から直接ビープ音を鳴らす */
+    testTone() {
+      this.unlock();
+      const ctx = this.ctx;
+      if (!ctx) return;
+      const t = ctx.currentTime + 0.02;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.frequency.value = 880;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start(t);
+      o.stop(t + 0.55);
+    }
+
+    _onLevel(peak, st) {
+      this.lastPeak = peak;
+      this.procSemitones = st;
+      this.emit();
       const v = this.video;
       const playing =
         v && this.attached.has(v) && !v.paused && !v.muted && v.volume > 0 && v.readyState >= 3;
@@ -746,6 +784,17 @@ button { -webkit-appearance: none; appearance: none; margin: 0; cursor: pointer;
 .msg { margin-top: 10px; font-size: 12px; line-height: 1.45; color: #ffd60a; }
 .msg:empty { display: none; }
 .status { margin-top: 6px; font-size: 10px; color: #8e8e93; text-align: right; }
+.diag { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.12); }
+.diag-text { font-size: 11px; color: #aeaeb2; font-variant-numeric: tabular-nums; }
+.diag-btns { display: flex; gap: 8px; margin-top: 6px; }
+.diag-btns button {
+  flex: 1; height: 36px;
+  border: none; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff; font-size: 13px;
+  touch-action: manipulation;
+}
+.diag-btns button.on { background: #ff453a; }
 `;
 
   function fmt(v) {
@@ -822,7 +871,19 @@ button { -webkit-appearance: none; appearance: none; margin: 0; cursor: pointer;
 
       this.msgEl = el('div', 'msg');
       this.statusEl = el('div', 'status');
-      this.panel.append(head, this.valueEl, this.slider, ticks, buttons, this.msgEl, this.statusEl);
+
+      // 診断（実機での不具合調査用）
+      const diag = el('div', 'diag');
+      this.diagText = el('div', 'diag-text');
+      const diagBtns = el('div', 'diag-btns');
+      this.muteBtn = el('button', 'mute', '処理音を消す');
+      this.toneBtn = el('button', 'tone', 'テスト音');
+      this.muteBtn.type = 'button';
+      this.toneBtn.type = 'button';
+      diagBtns.append(this.muteBtn, this.toneBtn);
+      diag.append(this.diagText, diagBtns);
+
+      this.panel.append(head, this.valueEl, this.slider, ticks, buttons, this.msgEl, this.statusEl, diag);
       root.append(this.fab, this.panel);
       this.host = host;
 
@@ -848,6 +909,8 @@ button { -webkit-appearance: none; appearance: none; margin: 0; cursor: pointer;
       this.minusBtn.addEventListener('click', () => this.setValue(this.value - CONFIG.STEP));
       this.plusBtn.addEventListener('click', () => this.setValue(this.value + CONFIG.STEP));
       this.resetBtn.addEventListener('click', () => this.setValue(0));
+      this.muteBtn.addEventListener('click', () => this.engine.setOutputMuted(!this.engine.outputMuted));
+      this.toneBtn.addEventListener('click', () => this.engine.testTone());
 
       const valueFromX = (x) => {
         const r = this.slider.getBoundingClientRect();
@@ -937,7 +1000,14 @@ button { -webkit-appearance: none; appearance: none; margin: 0; cursor: pointer;
       if (e.ctx) parts.push(Math.round(e.ctx.sampleRate / 100) / 10 + 'kHz', e.ctx.state);
       parts.push(e.srcType());
       parts.push(e.isAttached() ? '処理中' : '未接続');
-      this.statusEl.textContent = parts.join(' · ');
+      this.statusEl.textContent = parts.join(' · ') + ' · v' + VERSION;
+
+      const pk = e.lastPeak;
+      const level = pk == null ? '-' : pk > 0 ? Math.round(20 * Math.log10(pk)) + ' dB' : '無音';
+      const st = e.procSemitones == null ? '-' : fmt(e.procSemitones);
+      this.diagText.textContent = '診断: 入力レベル ' + level + ' / 処理側のキー ' + st;
+      this.muteBtn.textContent = e.outputMuted ? '処理音を戻す' : '処理音を消す';
+      this.muteBtn.classList.toggle('on', !!e.outputMuted);
     }
   }
 

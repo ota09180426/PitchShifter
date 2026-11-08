@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>UI smoke test</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" playsinline loop style="width:100%;height:220px;background:#000"></video>
+<pre id="out">running</pre>
+<!-- ?slow=1 のとき、遅延サーバーからの画像で load イベントを遅らせ、実時間で非同期テストを完了させる -->
+<script>if (new URLSearchParams(location.search).get('slow')) document.write('<img src="http://localhost:8765/delay.gif" width="1" height="1">');</script>
+<script>
+// 440Hz のステレオ WAV を生成して <video> で再生する（YouTube の代わり）
+(function () {
+  const sr = 48000, sec = 4, n = sr * sec;
+  const buf = new ArrayBuffer(44 + n * 4);
+  const dv = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); dv.setUint32(4, 36 + n * 4, true); w(8, 'WAVE'); w(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 2, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 4, true); dv.setUint16(32, 4, true); dv.setUint16(34, 16, true);
+  w(36, 'data'); dv.setUint32(40, n * 4, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.round(Math.sin(2 * Math.PI * 440 * i / sr) * 12000);
+    dv.setInt16(44 + i * 4, s, true); dv.setInt16(46 + i * 4, s, true);
+  }
+  const v = document.getElementById('v');
+  v.src = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  v.play().catch((e) => { document.getElementById('out').textContent = 'play failed: ' + e; });
+})();
+</script>
+<script src="../yt-pitch-shifter.user.js"></script>
+<script>
+(async function () {
+  const log = [];
+  const errors = [];
+  window.addEventListener('error', (e) => errors.push(String(e.message)));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const api = window.__ytPitchShifter;
+  const root = document.getElementById('yt-pitch-shifter-host').shadowRoot;
+  const q = (s) => root.querySelector(s);
+
+  // headless の仮想時間ではタイマーが早送りされるため、Worklet 読み込みのタイムアウトを実質無効化
+  if (new URLSearchParams(location.search).get('notimeout')) api.CONFIG.WORKLET_TIMEOUT_MS = 1e9;
+  await sleep(800);
+  log.push('fab before:' + q('.fab').textContent + ' / panel hidden=' + q('.panel').hidden);
+  q('.fab').click();
+  await sleep(1500);
+  log.push('panel hidden after fab click=' + q('.panel').hidden + ', mode=' + api.engine.mode + ', ctx=' + (api.engine.ctx && api.engine.ctx.state));
+  log.push('attached before change=' + api.engine.isAttached());
+
+  for (let i = 0; i < 5; i++) q('.plus').click();
+  await sleep(300);
+  log.push('after +x5: value=' + api.ui.value + ', fab=' + q('.fab').textContent + ', valueEl=' + q('.value').textContent);
+  log.push('attached after change=' + api.engine.isAttached() + ', dsp semitones(engine)=' + api.engine.semitones);
+
+  await sleep(2500);
+  // 処理後の出力をアナライザで測定（440Hz × 2^(2.5/12) ≈ 508.6Hz になっているはず）
+  if (api.engine.ctx && api.engine.node) {
+    const an = api.engine.ctx.createAnalyser();
+    an.fftSize = 32768;
+    api.engine.node.connect(an);
+    await sleep(1200);
+    const d = new Float32Array(an.frequencyBinCount);
+    an.getFloatFrequencyData(d);
+    let k = 1;
+    for (let i = 1; i < d.length - 1; i++) if (d[i] > d[k]) k = i;
+    const a = d[k - 1], b = d[k], c = d[k + 1];
+    const off = 0.5 * (a - c) / (a - 2 * b + c);
+    const f = (k + off) * api.engine.ctx.sampleRate / an.fftSize;
+    const exp = 440 * Math.pow(2, 2.5 / 12);
+    log.push('end-to-end output peak=' + f.toFixed(1) + 'Hz (expected ' + exp.toFixed(1) + 'Hz, err ' + (1200 * Math.log2(f / exp)).toFixed(1) + ' cent)');
+    api.engine.node.disconnect(an);
+  }
+  log.push('silent warn='+ api.engine.silent + ', msg=' + JSON.stringify(q('.msg').textContent));
+  log.push('status=' + q('.status').textContent + ', fallbackReason=' + api.engine.fallbackReason);
+
+  for (let i = 0; i < 30; i++) q('.plus').click();
+  log.push('clamp max: value=' + api.ui.value + ', plus disabled=' + q('.plus').disabled);
+  for (let i = 0; i < 40; i++) q('.minus').click();
+  log.push('clamp min: value=' + api.ui.value + ', minus disabled=' + q('.minus').disabled);
+  q('.reset').click();
+  log.push('reset: value=' + api.ui.value + ', fab=' + q('.fab').textContent);
+
+  // スライダーのドラッグ（中央 → 右端の 3/4 付近）
+  const r = q('.slider').getBoundingClientRect();
+  const fire = (type, x) => q('.slider').dispatchEvent(new PointerEvent(type, { bubbles: true, clientX: x, clientY: r.top + 10, pointerId: 1 }));
+  fire('pointerdown', r.left + r.width * 0.5);
+  fire('pointermove', r.left + r.width * 0.75);
+  fire('pointerup', r.left + r.width * 0.75);
+  log.push('slider 75%: value=' + api.ui.value + ' (expected +3)');
+  fire('pointerdown', r.left + r.width * 0.545);
+  fire('pointerup', r.left + r.width * 0.545);
+  log.push('slider 54.5%: value=' + api.ui.value + ' (expected +0.5)');
+
+  // 動画切替で ±0 に戻るか（URL の v パラメータを変える）
+  history.pushState({}, '', location.pathname + '?v=AAAAAAAAAAA');
+  await sleep(700);
+  q('.plus').click(); q('.plus').click();
+  log.push('set on video A: value=' + api.ui.value);
+  history.pushState({}, '', location.pathname + '?v=BBBBBBBBBBB');
+  await sleep(700);
+  log.push('after switching to video B: value=' + api.ui.value + ' (expected 0)');
+
+  log.push('errors=' + JSON.stringify(errors));
+  // スクリーンショット用に +1.5 にしておく
+  q('.plus').click(); q('.plus').click(); q('.plus').click();
+  document.getElementById('out').textContent = log.join('\n');
+})();
+</script>
+</body>
+</html>
